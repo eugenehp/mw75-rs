@@ -77,7 +77,17 @@ const READ_BUF_SIZE: usize = 1024;
 /// Post-BLE-disconnect settle time in milliseconds.
 /// Required on some platforms (especially macOS) for the Bluetooth stack
 /// to release the BLE connection before RFCOMM can connect.
-const BLE_SETTLE_MS: u64 = 500;
+const BLE_SETTLE_MS: u64 = 1000;
+
+/// Maximum number of RFCOMM connection attempts on macOS.
+/// Each attempt waits progressively longer before retrying.
+#[cfg(target_os = "macos")]
+const MACOS_RFCOMM_MAX_RETRIES: u32 = 5;
+
+/// Base delay between RFCOMM connection retries on macOS (milliseconds).
+/// Multiplied by the attempt number: 500, 1000, 1500, 2000, 2500 ms.
+#[cfg(target_os = "macos")]
+const MACOS_RFCOMM_RETRY_BASE_MS: u64 = 500;
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -373,21 +383,43 @@ fn macos_rfcomm_thread_by_name(
         }
     };
 
-    // Open RFCOMM channel synchronously
+    // Open RFCOMM channel synchronously, with retries.
     // IOBluetoothDevice.openRFCOMMChannelSync:withChannelID:delegate:
+    // After BLE disconnect the Bluetooth stack may need time to release
+    // the radio; retry with increasing back-off.
     let mut channel_ptr: *mut AnyObject = std::ptr::null_mut();
-    let result: i32 = unsafe {
-        msg_send![
-            &*device,
-            openRFCOMMChannelSync: &mut channel_ptr,
-            withChannelID: RFCOMM_CHANNEL as u8,
-            delegate: std::ptr::null::<AnyObject>()
-        ]
-    };
+    let mut last_result: i32 = 0;
 
-    if result != 0 || channel_ptr.is_null() {
+    for attempt in 1..=MACOS_RFCOMM_MAX_RETRIES {
+        channel_ptr = std::ptr::null_mut();
+        last_result = unsafe {
+            msg_send![
+                &*device,
+                openRFCOMMChannelSync: &mut channel_ptr,
+                withChannelID: RFCOMM_CHANNEL as u8,
+                delegate: std::ptr::null::<AnyObject>()
+            ]
+        };
+
+        if last_result == 0 && !channel_ptr.is_null() {
+            info!("macOS RFCOMM: channel opened on attempt {attempt}");
+            break;
+        }
+
+        if attempt < MACOS_RFCOMM_MAX_RETRIES {
+            let delay_ms = MACOS_RFCOMM_RETRY_BASE_MS * attempt as u64;
+            info!(
+                "macOS RFCOMM: open failed (status=0x{last_result:08x}), \
+                 retrying in {delay_ms} ms (attempt {attempt}/{MACOS_RFCOMM_MAX_RETRIES}) …"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
+    }
+
+    if last_result != 0 || channel_ptr.is_null() {
         let _ = status_tx.blocking_send(Err(anyhow!(
-            "macOS: RFCOMM channel open failed (status=0x{result:08x})"
+            "macOS: RFCOMM channel open failed after {MACOS_RFCOMM_MAX_RETRIES} attempts \
+             (last status=0x{last_result:08x})"
         )));
         return;
     }
