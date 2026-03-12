@@ -295,27 +295,27 @@ fn macos_rfcomm_thread_by_name(
     use objc2_foundation::{NSArray, NSDate, NSRunLoop, NSString};
     use objc2_io_bluetooth::IOBluetoothDevice;
 
-    // On macOS, CoreBluetooth returns UUIDs, not MAC addresses.
-    // We look up the IOBluetooth device by scanning paired/recent devices
-    // and matching by name.
-    info!("macOS RFCOMM: looking up IOBluetooth device by name '{device_name}'…");
+    // ── Step 1: Find the IOBluetoothDevice by name ────────────────────────────
+    //
+    // CoreBluetooth (btleplug) gives us a UUID, not a MAC address.
+    // IOBluetooth is a separate Classic-BT framework, so we search
+    // pairedDevices / recentDevices by name to bridge the two worlds.
 
-    // Try pairedDevices first, then recentDevices
+    info!("macOS RFCOMM: looking up IOBluetooth device by name '{device_name}' …");
+
     let device: Option<Retained<IOBluetoothDevice>> = unsafe {
-        // pairedDevices returns an NSArray of IOBluetoothDevice
-        let paired: Option<Retained<NSArray<IOBluetoothDevice>>> =
-            msg_send![IOBluetoothDevice::class(), pairedDevices];
-
         let mut found: Option<Retained<IOBluetoothDevice>> = None;
 
+        // Search paired devices
+        let paired: Option<Retained<NSArray<IOBluetoothDevice>>> =
+            msg_send![IOBluetoothDevice::class(), pairedDevices];
         if let Some(ref devices) = paired {
             let count: usize = msg_send![devices, count];
             for i in 0..count {
                 let dev: Retained<IOBluetoothDevice> = msg_send![devices, objectAtIndex: i];
                 let name_ptr: *const NSString = msg_send![&*dev, name];
                 if !name_ptr.is_null() {
-                    let ns_name: &NSString = &*name_ptr;
-                    let name_str = ns_name.to_string();
+                    let name_str = (*name_ptr).to_string();
                     debug!("macOS RFCOMM: paired device: {name_str}");
                     if name_str == device_name {
                         found = Some(dev);
@@ -325,7 +325,7 @@ fn macos_rfcomm_thread_by_name(
             }
         }
 
-        // Also try recentDevices if not found in paired
+        // Fallback: search recent devices
         if found.is_none() {
             let recent: Option<Retained<NSArray<IOBluetoothDevice>>> =
                 msg_send![IOBluetoothDevice::class(), recentDevices: 10usize];
@@ -335,8 +335,7 @@ fn macos_rfcomm_thread_by_name(
                     let dev: Retained<IOBluetoothDevice> = msg_send![devices, objectAtIndex: i];
                     let name_ptr: *const NSString = msg_send![&*dev, name];
                     if !name_ptr.is_null() {
-                        let ns_name: &NSString = &*name_ptr;
-                        let name_str = ns_name.to_string();
+                        let name_str = (*name_ptr).to_string();
                         debug!("macOS RFCOMM: recent device: {name_str}");
                         if name_str == device_name {
                             found = Some(dev);
@@ -353,7 +352,7 @@ fn macos_rfcomm_thread_by_name(
     let device = match device {
         Some(d) => d,
         None => {
-            // If we can't find by name, try parsing as MAC as a fallback
+            // Last resort: try parsing as MAC address
             if let Ok(mac_bytes) = parse_mac(&address) {
                 let addr_str = format!(
                     "{:02X}-{:02X}-{:02X}-{:02X}-{:02X}-{:02X}",
@@ -368,7 +367,8 @@ fn macos_rfcomm_thread_by_name(
                     Some(d) => d,
                     None => {
                         let _ = status_tx.blocking_send(Err(anyhow!(
-                            "macOS: IOBluetoothDevice not found by name '{device_name}' or address '{address}'"
+                            "macOS: IOBluetoothDevice not found by name '{device_name}' \
+                             or address '{address}'"
                         )));
                         return;
                     }
@@ -383,10 +383,58 @@ fn macos_rfcomm_thread_by_name(
         }
     };
 
-    // Open RFCOMM channel synchronously, with retries.
-    // IOBluetoothDevice.openRFCOMMChannelSync:withChannelID:delegate:
-    // After BLE disconnect the Bluetooth stack may need time to release
-    // the radio; retry with increasing back-off.
+    // Log device address for diagnostics
+    unsafe {
+        let addr_ptr: *const NSString = msg_send![&*device, addressString];
+        if !addr_ptr.is_null() {
+            let addr = (*addr_ptr).to_string();
+            info!("macOS RFCOMM: found device '{device_name}' at address {addr}");
+        } else {
+            info!("macOS RFCOMM: found device '{device_name}' (address unavailable)");
+        }
+    }
+
+    // ── Step 2: Ensure Classic BT baseband connection ─────────────────────────
+    //
+    // IOBluetooth's openRFCOMMChannelSync *should* establish the baseband
+    // connection automatically, but on recent macOS versions (especially after
+    // a BLE disconnect) an explicit openConnection + SDP query helps the
+    // Bluetooth stack realize the device is reachable over Classic BT.
+
+    let is_connected: bool = unsafe { msg_send![&*device, isConnected] };
+    info!("macOS RFCOMM: device isConnected = {is_connected}");
+
+    if !is_connected {
+        info!("macOS RFCOMM: opening baseband connection …");
+        let connect_result: i32 = unsafe { msg_send![&*device, openConnection] };
+        if connect_result != 0 {
+            info!(
+                "macOS RFCOMM: openConnection returned 0x{connect_result:08x} \
+                 (may still succeed via openRFCOMMChannelSync)"
+            );
+        } else {
+            info!("macOS RFCOMM: baseband connection established");
+        }
+    }
+
+    // ── Step 3: SDP query to let the stack discover RFCOMM services ───────────
+
+    info!("macOS RFCOMM: performing SDP query …");
+    let sdp_result: i32 = unsafe {
+        msg_send![&*device, performSDPQuery: std::ptr::null::<AnyObject>()]
+    };
+    if sdp_result != 0 {
+        info!(
+            "macOS RFCOMM: SDP query returned 0x{sdp_result:08x} (non-fatal, continuing)"
+        );
+    } else {
+        info!("macOS RFCOMM: SDP query complete");
+        // Give the stack a moment to process SDP results
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    // ── Step 4: Open RFCOMM channel with retries ──────────────────────────────
+
     let mut channel_ptr: *mut AnyObject = std::ptr::null_mut();
     let mut last_result: i32 = 0;
 
@@ -402,15 +450,15 @@ fn macos_rfcomm_thread_by_name(
         };
 
         if last_result == 0 && !channel_ptr.is_null() {
-            info!("macOS RFCOMM: channel opened on attempt {attempt}");
+            info!("macOS RFCOMM: channel {RFCOMM_CHANNEL} opened on attempt {attempt}");
             break;
         }
 
         if attempt < MACOS_RFCOMM_MAX_RETRIES {
             let delay_ms = MACOS_RFCOMM_RETRY_BASE_MS * attempt as u64;
             info!(
-                "macOS RFCOMM: open failed (status=0x{last_result:08x}), \
-                 retrying in {delay_ms} ms (attempt {attempt}/{MACOS_RFCOMM_MAX_RETRIES}) …"
+                "macOS RFCOMM: openRFCOMMChannelSync failed (0x{last_result:08x}), \
+                 retrying in {delay_ms} ms ({attempt}/{MACOS_RFCOMM_MAX_RETRIES}) …"
             );
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         }
@@ -418,42 +466,35 @@ fn macos_rfcomm_thread_by_name(
 
     if last_result != 0 || channel_ptr.is_null() {
         let _ = status_tx.blocking_send(Err(anyhow!(
-            "macOS: RFCOMM channel open failed after {MACOS_RFCOMM_MAX_RETRIES} attempts \
-             (last status=0x{last_result:08x})"
+            "macOS: RFCOMM channel {RFCOMM_CHANNEL} open failed after \
+             {MACOS_RFCOMM_MAX_RETRIES} attempts (last status=0x{last_result:08x})"
         )));
         return;
     }
 
-    // Notify success
+    // ── Step 5: Connected — notify caller and pump NSRunLoop ──────────────────
+
     let _ = status_tx.blocking_send(Ok(()));
 
-    // Run NSRunLoop to pump IOBluetooth events.
-    // Data arrives via the delegate callback; since we're not using a delegate
-    // in this simplified version, we use an alternative: periodically poll or
-    // use a registered RFCOMM data callback.
+    // IOBluetooth delivers data via delegate callbacks on the NSRunLoop.
+    // Without a delegate, we keep the runloop alive so that when a proper
+    // delegate is wired up, callbacks will be delivered.
     //
-    // NOTE: A full macOS implementation requires an NSObject subclass as a delegate
-    // for rfcommChannelData:data:length: callbacks. This is complex with objc2.
-    // For now, we use the synchronous read approach with NSRunLoop pumping.
+    // TODO: implement an NSObject subclass that conforms to
+    // IOBluetoothRFCOMMChannelDelegate and forwards
+    // rfcommChannelData:data:length: into `data_tx`.
 
     let runloop = NSRunLoop::currentRunLoop();
     loop {
-        // Pump the runloop for 1ms
-        let date = NSDate::dateWithTimeIntervalSinceNow(0.001);
+        let date = NSDate::dateWithTimeIntervalSinceNow(0.1);
         runloop.runUntilDate(&date);
 
-        // Check if channel is still open
         let is_open: bool = unsafe { msg_send![channel_ptr, isOpen] };
         if !is_open {
-            let _ = data_tx.send(Vec::new()); // Signal closed
+            info!("macOS RFCOMM: channel closed");
+            let _ = data_tx.send(Vec::new());
             break;
         }
-
-        // NOTE: Actual data delivery requires a delegate with
-        // rfcommChannelData:data:length: — the macOS IOBluetooth framework
-        // does not support synchronous reads on RFCOMM channels.
-        // This loop keeps the runloop alive for delegate callbacks.
-        // A production implementation would use a proper ObjC delegate class.
     }
 }
 
