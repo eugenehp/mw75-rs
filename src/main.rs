@@ -83,30 +83,29 @@ async fn connect_and_run(
     handle.start().await?;
     info!("Activation complete.");
 
-    // ── RFCOMM ────────────────────────────────────────────────────────────────
+    // ── Data transport ──────────────────────────────────────────────────────
+    //
+    // Stay on BLE and listen for data via notifications.
+    // RFCOMM can be re-enabled later once baseband connection issues are resolved.
+    // Set RFCOMM=1 environment variable to force RFCOMM mode.
     #[cfg(feature = "rfcomm")]
-    let _rfcomm_task = {
+    let _rfcomm_task = if std::env::var("RFCOMM").unwrap_or_default() == "1" {
         let bt_address = handle.peripheral_id();
-        info!("Starting RFCOMM stream to {bt_address} …");
-
-        // Disconnect BLE first (required on macOS, recommended on Linux)
+        info!("RFCOMM=1: Starting RFCOMM stream to {bt_address} …");
         handle.disconnect_ble().await.ok();
-
         let rfcomm_handle = handle.clone();
         match mw75::rfcomm::start_rfcomm_stream(rfcomm_handle, &bt_address).await {
-            Ok(task) => {
-                info!("RFCOMM reader task started");
-                Some(task)
-            }
-            Err(e) => {
-                info!("RFCOMM connect failed ({e}), falling back to feed_data mode");
-                None
-            }
+            Ok(task) => { info!("RFCOMM reader task started"); Some(task) }
+            Err(e) => { info!("RFCOMM failed ({e}), BLE stream active"); None }
         }
+    } else {
+        info!("BLE-only mode: listening for EEG data on BLE notifications …");
+        info!("  (set RFCOMM=1 to force RFCOMM transport)");
+        None
     };
 
     #[cfg(not(feature = "rfcomm"))]
-    info!("RFCOMM feature not enabled. Streaming EEG data via BLE notifications …");
+    info!("Streaming EEG data via BLE notifications …");
 
     info!("Press Ctrl-C or type 'q' + Enter to quit.\n");
     info!("Commands: q = quit, s = stats\n");

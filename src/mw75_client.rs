@@ -371,11 +371,39 @@ impl Mw75Client {
             };
             info!("BLE notification stream active, waiting for data…");
 
+            let mut notif_count: u64 = 0;
+            let mut notif_counts_by_char: std::collections::HashMap<Uuid, u64> = std::collections::HashMap::new();
+
             while let Some(notif) = notifications.next().await {
                 let data = &notif.value;
+                notif_count += 1;
+                let char_count = notif_counts_by_char.entry(notif.uuid).or_insert(0);
+                *char_count += 1;
 
-                let hex: String = data.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
-                debug!("BLE notification on {} ({} bytes): {hex}", notif.uuid, data.len());
+                // Build hex string for logging
+                let hex_str: String = if data.len() <= 64 {
+                    data.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
+                } else {
+                    let head: String = data[..32].iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+                    format!("{head} … ({} bytes total)", data.len())
+                };
+
+                // Determine characteristic label
+                let char_short = match notif.uuid {
+                    u if u == status_char_uuid => "STATUS_1102",
+                    u if u == Uuid::from_u128(0x00001103_d102_11e1_9b23_00025b00a5a5) => "DATA_1103",
+                    u if u == Uuid::from_u128(0x00001105_d102_11e1_9b23_00025b00a5a6) => "STATUS_1105",
+                    u if u == Uuid::from_u128(0x00001106_d102_11e1_9b23_00025b00a5a6) => "DATA_1106",
+                    _ => "OTHER",
+                };
+
+                // Log first 50 notifications per characteristic at info level,
+                // then switch to debug to avoid flooding
+                if *char_count <= 50 {
+                    info!("📨 {char_short} #{char_count} ({} B): {hex_str}", data.len());
+                } else if *char_count == 51 {
+                    info!("📨 {char_short} — suppressing further raw logs (received 50+)");
+                }
 
                 // Status characteristic: parse command responses
                 if notif.uuid == status_char_uuid && data.len() >= 5
@@ -409,23 +437,42 @@ impl Mw75Client {
                 }
 
                 // Any other notification: try to parse as EEG data
-                // Feed into the packet processor (handles sync alignment,
-                // split delivery, checksum validation, etc.)
                 let events = {
                     let mut proc = ble_processor_clone.lock().unwrap();
                     proc.process_data(data)
                 };
                 if !events.is_empty() {
-                    debug!("BLE data: parsed {} event(s) from {} bytes", events.len(), data.len());
+                    info!("✅ Parsed {} EEG packet(s) from {char_short} ({} bytes)", events.len(), data.len());
                     for event in events {
                         let _ = notification_tx.send(event).await;
                     }
-                } else if data.len() > 5 {
-                    // Log unrecognised large notifications for debugging
-                    debug!(
-                        "BLE notification on {}: {} bytes, no packets parsed",
-                        notif.uuid, data.len()
-                    );
+                } else if data.len() > 5 && *char_count <= 50 {
+                    // Show first byte analysis for non-parsed data
+                    let first = data[0];
+                    let annotation = if first == 0xAA {
+                        format!("sync=0xAA event_id={} len={} counter={}", 
+                            data.get(1).unwrap_or(&0), data.get(2).unwrap_or(&0), data.get(3).unwrap_or(&0))
+                    } else {
+                        format!("first_byte=0x{first:02x} (not 0xAA sync)")
+                    };
+                    info!("   ↳ no packet parsed: {annotation}");
+                }
+
+                // Periodic summary every 100 notifications
+                if notif_count % 100 == 0 {
+                    let summary: String = notif_counts_by_char.iter()
+                        .map(|(uuid, count)| {
+                            let lbl = match *uuid {
+                                u if u == status_char_uuid => "STATUS_1102",
+                                u if u == Uuid::from_u128(0x00001103_d102_11e1_9b23_00025b00a5a5) => "DATA_1103",
+                                u if u == Uuid::from_u128(0x00001105_d102_11e1_9b23_00025b00a5a6) => "STATUS_1105",
+                                u if u == Uuid::from_u128(0x00001106_d102_11e1_9b23_00025b00a5a6) => "DATA_1106",
+                                _ => "OTHER",
+                            };
+                            format!("{lbl}={count}")
+                        })
+                        .collect::<Vec<_>>().join(", ");
+                    info!("📊 Notification total: {notif_count} — {summary}");
                 }
             }
 
