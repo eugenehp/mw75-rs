@@ -32,6 +32,11 @@ name = "mw75-audio"
 path = "src/bin/audio.rs"
 required-features = ["audio"]
 
+[[bin]]
+name = "rfcomm-debug"
+path = "src/bin/rfcomm_debug.rs"
+required-features = ["rfcomm"]
+
 # ── Features ──────────────────────────────────────────────────────────────────
 #
 # default  — TUI only (no heavy Bluetooth deps beyond btleplug)
