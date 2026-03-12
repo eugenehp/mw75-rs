@@ -163,18 +163,35 @@ impl Mw75Client {
         tokio::time::sleep(Duration::from_secs(self.config.scan_timeout_secs)).await;
         adapter.stop_scan().await.ok();
 
-        let pattern = self.config.name_pattern.to_uppercase();
+        let upper_pattern = self.config.name_pattern.to_uppercase();
+        let pattern_bytes = upper_pattern.as_bytes();
         let mut found = vec![];
         for p in adapter.peripherals().await? {
             if let Ok(Some(props)) = p.properties().await {
-                let name = props.local_name.as_deref().unwrap_or("<no name>");
+                let name = props.local_name.clone().unwrap_or_default();
                 let id = p.id().to_string();
-                debug!("scan_all: saw peripheral: {name}  id={id}");
-                if name.to_uppercase().contains(&pattern) {
-                    let name = name.to_owned();
-                    info!("scan_all: found {name}  id={id}");
+                debug!("scan_all: saw peripheral: name={name:?}  id={id}");
+
+                let matched = (!name.is_empty()
+                    && name.to_uppercase().contains(&upper_pattern))
+                    || props.services.contains(&MW75_SERVICE_UUID)
+                    || props.manufacturer_data.values().any(|data| {
+                        let upper: Vec<u8> =
+                            data.iter().map(|b| b.to_ascii_uppercase()).collect();
+                        upper
+                            .windows(pattern_bytes.len())
+                            .any(|w| w == pattern_bytes)
+                    });
+
+                if matched {
+                    let display_name = if name.is_empty() {
+                        "MW75 (matched by UUID/mfg)".to_owned()
+                    } else {
+                        name
+                    };
+                    info!("scan_all: found {display_name}  id={id}");
                     found.push(Mw75Device {
-                        name,
+                        name: display_name,
                         id,
                         peripheral: p,
                         adapter: adapter.clone(),
@@ -244,7 +261,9 @@ impl Mw75Client {
         };
 
         let props = peripheral.properties().await?.unwrap_or_default();
-        let device_name = props.local_name.unwrap_or_else(|| "Unknown".into());
+        let device_name = props
+            .local_name
+            .unwrap_or_else(|| format!("MW75 ({})", peripheral.id()));
         info!("Found device: {device_name}");
 
         self.setup_peripheral(peripheral, device_name, adapter)
@@ -389,6 +408,14 @@ impl Mw75Client {
 
     // ── Private: find_first ───────────────────────────────────────────────────
 
+    /// Discover the first MW75 peripheral using multiple heuristics:
+    ///
+    /// 1. **Name match** — `local_name` contains the pattern (e.g. "MW75").
+    /// 2. **Service UUID match** — advertised services include `MW75_SERVICE_UUID`.
+    /// 3. **Manufacturer data match** — mfg data bytes contain the pattern as ASCII.
+    ///
+    /// On macOS CoreBluetooth, `local_name` is often `None` for already-paired
+    /// devices, so (2) and (3) are critical fallbacks.
     async fn find_first(
         &self,
         adapter: &Adapter,
@@ -396,6 +423,7 @@ impl Mw75Client {
         timeout_secs: u64,
     ) -> Result<Peripheral> {
         let upper_pattern = pattern.to_uppercase();
+        let pattern_bytes = upper_pattern.as_bytes();
         let mut logged_peripherals = std::collections::HashSet::new();
 
         let result = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
@@ -405,14 +433,58 @@ impl Mw75Client {
                     if let Ok(Some(props)) = p.properties().await {
                         let id = p.id().to_string();
                         let name = props.local_name.clone().unwrap_or_default();
+                        let services = &props.services;
+                        let mfg_data = &props.manufacturer_data;
 
                         // Log each peripheral once for debugging
-                        if !name.is_empty() && logged_peripherals.insert(id.clone()) {
-                            debug!("find_first: saw peripheral: {name}  id={id}");
+                        if logged_peripherals.insert(id.clone()) {
+                            let svc_summary: String = services
+                                .iter()
+                                .map(|u| u.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            let mfg_summary: String = mfg_data
+                                .iter()
+                                .map(|(k, v)| format!("0x{k:04X}[{}B]", v.len()))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            debug!(
+                                "scan: id={id}  name={:?}  services=[{svc_summary}]  mfg=[{mfg_summary}]",
+                                if name.is_empty() { "<none>" } else { &name }
+                            );
                         }
 
-                        if name.to_uppercase().contains(&upper_pattern) {
+                        // Match 1: name contains pattern
+                        if !name.is_empty()
+                            && name.to_uppercase().contains(&upper_pattern)
+                        {
+                            info!("Matched by name: {name}  id={id}");
                             return p;
+                        }
+
+                        // Match 2: advertised services include MW75_SERVICE_UUID
+                        if services.contains(&MW75_SERVICE_UUID) {
+                            info!(
+                                "Matched by service UUID: name={:?}  id={id}",
+                                if name.is_empty() { "<none>" } else { &name }
+                            );
+                            return p;
+                        }
+
+                        // Match 3: manufacturer data contains pattern as ASCII
+                        for (_company_id, data) in mfg_data {
+                            let upper_data: Vec<u8> =
+                                data.iter().map(|b| b.to_ascii_uppercase()).collect();
+                            if upper_data
+                                .windows(pattern_bytes.len())
+                                .any(|w| w == pattern_bytes)
+                            {
+                                info!(
+                                    "Matched by manufacturer data: name={:?}  id={id}",
+                                    if name.is_empty() { "<none>" } else { &name }
+                                );
+                                return p;
+                            }
                         }
                     }
                 }
@@ -423,7 +495,8 @@ impl Mw75Client {
 
         if result.is_err() {
             warn!(
-                "Scan found {} named peripheral(s) but none matched '{pattern}'",
+                "Scan saw {} peripheral(s) total but none matched '{pattern}' \
+                 by name, service UUID, or manufacturer data",
                 logged_peripherals.len()
             );
         }
