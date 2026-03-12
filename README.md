@@ -37,7 +37,7 @@ This crate provides:
 
 ```toml
 [dependencies]
-mw75 = { version = "0.1.0", features = ["rfcomm"] }
+mw75 = { version = "0.0.1", features = ["rfcomm"] }
 ```
 
 ```rust
