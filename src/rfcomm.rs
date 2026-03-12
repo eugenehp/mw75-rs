@@ -82,7 +82,7 @@ const BLE_SETTLE_MS: u64 = 1000;
 /// Maximum number of RFCOMM connection attempts on macOS.
 /// Each attempt waits progressively longer before retrying.
 #[cfg(target_os = "macos")]
-const MACOS_RFCOMM_MAX_RETRIES: u32 = 5;
+const MACOS_RFCOMM_MAX_RETRIES: u32 = 8;
 
 /// Base delay between RFCOMM connection retries on macOS (milliseconds).
 /// Multiplied by the attempt number: 500, 1000, 1500, 2000, 2500 ms.
@@ -400,6 +400,12 @@ fn macos_rfcomm_thread_by_name(
     // connection automatically, but on recent macOS versions (especially after
     // a BLE disconnect) an explicit openConnection + SDP query helps the
     // Bluetooth stack realize the device is reachable over Classic BT.
+    //
+    // IMPORTANT: Both `openConnection` and `performSDPQuery:` are asynchronous
+    // on modern macOS — they return immediately and deliver results via the
+    // NSRunLoop. We must pump the run loop to let them complete.
+
+    let runloop = NSRunLoop::currentRunLoop();
 
     let is_connected: bool = unsafe { msg_send![&*device, isConnected] };
     info!("macOS RFCOMM: device isConnected = {is_connected}");
@@ -413,11 +419,35 @@ fn macos_rfcomm_thread_by_name(
                  (may still succeed via openRFCOMMChannelSync)"
             );
         } else {
-            info!("macOS RFCOMM: baseband connection established");
+            info!("macOS RFCOMM: openConnection initiated (status=0)");
+        }
+
+        // Pump the run loop to let the baseband connection establish
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let date = NSDate::dateWithTimeIntervalSinceNow(0.1);
+            runloop.runUntilDate(&date);
+
+            let connected: bool = unsafe { msg_send![&*device, isConnected] };
+            if connected {
+                info!("macOS RFCOMM: baseband connection established");
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                info!(
+                    "macOS RFCOMM: baseband connection timeout (5 s), \
+                     continuing anyway …"
+                );
+                break;
+            }
         }
     }
 
     // ── Step 3: SDP query to let the stack discover RFCOMM services ───────────
+    //
+    // `performSDPQuery:` is async since macOS 10.7 — we must run the
+    // NSRunLoop to process the response.  We poll for service records
+    // to appear on the device.
 
     info!("macOS RFCOMM: performing SDP query …");
     let sdp_result: i32 = unsafe {
@@ -428,9 +458,35 @@ fn macos_rfcomm_thread_by_name(
             "macOS RFCOMM: SDP query returned 0x{sdp_result:08x} (non-fatal, continuing)"
         );
     } else {
-        info!("macOS RFCOMM: SDP query complete");
-        // Give the stack a moment to process SDP results
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        info!("macOS RFCOMM: SDP query initiated …");
+        // Pump the run loop to let SDP results arrive
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut services_found = false;
+        loop {
+            let date = NSDate::dateWithTimeIntervalSinceNow(0.1);
+            runloop.runUntilDate(&date);
+
+            // Check if the device now has service records
+            let services: *const AnyObject = unsafe { msg_send![&*device, services] };
+            if !services.is_null() {
+                let count: usize = unsafe { msg_send![services, count] };
+                if count > 0 {
+                    info!("macOS RFCOMM: SDP query complete — {count} service record(s)");
+                    services_found = true;
+                    break;
+                }
+            }
+
+            if std::time::Instant::now() >= deadline {
+                info!("macOS RFCOMM: SDP query timeout (5 s), continuing …");
+                break;
+            }
+        }
+        if !services_found {
+            // Extra settle time if SDP didn't return services
+            let date = NSDate::dateWithTimeIntervalSinceNow(1.0);
+            runloop.runUntilDate(&date);
+        }
     }
 
     // ── Step 4: Open RFCOMM channel with retries ──────────────────────────────
@@ -460,7 +516,10 @@ fn macos_rfcomm_thread_by_name(
                 "macOS RFCOMM: openRFCOMMChannelSync failed (0x{last_result:08x}), \
                  retrying in {delay_ms} ms ({attempt}/{MACOS_RFCOMM_MAX_RETRIES}) …"
             );
-            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            // Pump the run loop during the retry delay instead of sleeping,
+            // so the Bluetooth stack can process pending events.
+            let date = NSDate::dateWithTimeIntervalSinceNow(delay_ms as f64 / 1000.0);
+            runloop.runUntilDate(&date);
         }
     }
 
@@ -484,7 +543,6 @@ fn macos_rfcomm_thread_by_name(
     // IOBluetoothRFCOMMChannelDelegate and forwards
     // rfcommChannelData:data:length: into `data_tx`.
 
-    let runloop = NSRunLoop::currentRunLoop();
     loop {
         let date = NSDate::dateWithTimeIntervalSinceNow(0.1);
         runloop.runUntilDate(&date);
