@@ -275,6 +275,14 @@ impl Mw75Client {
 
         let chars: BTreeSet<Characteristic> = peripheral.characteristics();
 
+        // Log all discovered characteristics for diagnostics
+        for c in &chars {
+            info!(
+                "  characteristic: uuid={} properties={:?}",
+                c.uuid, c.properties
+            );
+        }
+
         let find_char = |uuid: Uuid| -> Result<Characteristic> {
             chars
                 .iter()
@@ -287,9 +295,29 @@ impl Mw75Client {
         let command_char = find_char(MW75_COMMAND_CHAR)?;
         let status_char = find_char(MW75_STATUS_CHAR)?;
 
-        // Subscribe to status notifications
-        peripheral.subscribe(&status_char).await?;
-        info!("BLE notifications enabled on status characteristic");
+        // Subscribe to ALL notifiable characteristics (status + any data chars)
+        use btleplug::api::CharPropFlags;
+        let mut subscribed_chars = Vec::new();
+        for c in &chars {
+            if c.properties.contains(CharPropFlags::NOTIFY)
+                || c.properties.contains(CharPropFlags::INDICATE)
+            {
+                match peripheral.subscribe(c).await {
+                    Ok(()) => {
+                        info!("BLE notifications enabled on {}", c.uuid);
+                        subscribed_chars.push(c.uuid);
+                    }
+                    Err(e) => {
+                        warn!("Failed to subscribe to {}: {e}", c.uuid);
+                    }
+                }
+            }
+        }
+        if subscribed_chars.is_empty() {
+            // Fallback: at least subscribe to status
+            peripheral.subscribe(&status_char).await?;
+            info!("BLE notifications enabled on status characteristic (fallback)");
+        }
 
         // Event channel
         let (tx, rx) = mpsc::channel::<Mw75Event>(256);
@@ -325,10 +353,14 @@ impl Mw75Client {
             }
         });
 
-        // Spawn notification handler for BLE status responses
+        // Spawn notification handler for BLE responses AND data streaming
         let notification_tx = tx.clone();
         let peripheral_clone = peripheral.clone();
         let expected_flag2 = ble_disconnect_expected.clone();
+        let status_char_uuid = status_char.uuid;
+        // Shared processor for BLE data notifications
+        let ble_processor = Arc::new(std::sync::Mutex::new(PacketProcessor::new(false)));
+        let ble_processor_clone = ble_processor.clone();
         tokio::spawn(async move {
             let mut notifications = match peripheral_clone.notifications().await {
                 Ok(n) => n,
@@ -337,15 +369,18 @@ impl Mw75Client {
                     return;
                 }
             };
-            info!("BLE notification stream active, waiting for status responses…");
+            info!("BLE notification stream active, waiting for data…");
 
             while let Some(notif) = notifications.next().await {
                 let data = &notif.value;
 
                 let hex: String = data.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
-                debug!("BLE notification ({} bytes): {hex}", data.len());
+                debug!("BLE notification on {} ({} bytes): {hex}", notif.uuid, data.len());
 
-                if data.len() >= 5 {
+                // Status characteristic: parse command responses
+                if notif.uuid == status_char_uuid && data.len() >= 5
+                    && data[0] == 0x09 && data[1] == 0x9A
+                {
                     let cmd_type = data[3];
                     let status = data[4];
 
@@ -354,7 +389,6 @@ impl Mw75Client {
                     } else if cmd_type == BLE_RAW_MODE_COMMAND && status == BLE_SUCCESS_CODE {
                         info!("Raw mode confirmed enabled");
                     } else if cmd_type == BLE_BATTERY_COMMAND {
-                        // Battery response: [09 9A 03 14 F1 level] or [09 9A 03 14 level]
                         let level = if status == BLE_SUCCESS_CODE && data.len() >= 6 {
                             data[5]
                         } else {
@@ -367,10 +401,31 @@ impl Mw75Client {
                     } else if cmd_type == BLE_UNKNOWN_E0_COMMAND {
                         debug!("Unknown E0 command response: status=0x{status:02x}");
                     } else {
-                        debug!(
-                            "Unrecognised BLE response: cmd=0x{cmd_type:02x} status=0x{status:02x}"
+                        warn!(
+                            "Unexpected BLE response: cmd=0x{cmd_type:02x} status=0x{status:02x}"
                         );
                     }
+                    continue;
+                }
+
+                // Any other notification: try to parse as EEG data
+                // Feed into the packet processor (handles sync alignment,
+                // split delivery, checksum validation, etc.)
+                let events = {
+                    let mut proc = ble_processor_clone.lock().unwrap();
+                    proc.process_data(data)
+                };
+                if !events.is_empty() {
+                    debug!("BLE data: parsed {} event(s) from {} bytes", events.len(), data.len());
+                    for event in events {
+                        let _ = notification_tx.send(event).await;
+                    }
+                } else if data.len() > 5 {
+                    // Log unrecognised large notifications for debugging
+                    debug!(
+                        "BLE notification on {}: {} bytes, no packets parsed",
+                        notif.uuid, data.len()
+                    );
                 }
             }
 

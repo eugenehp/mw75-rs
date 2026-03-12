@@ -106,7 +106,7 @@ async fn connect_and_run(
     };
 
     #[cfg(not(feature = "rfcomm"))]
-    info!("RFCOMM feature not enabled. Waiting for data via feed_data() …");
+    info!("RFCOMM feature not enabled. Streaming EEG data via BLE notifications …");
 
     info!("Press Ctrl-C or type 'q' + Enter to quit.\n");
     info!("Commands: q = quit, s = stats\n");
