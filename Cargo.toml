@@ -37,6 +37,11 @@ name = "rfcomm-debug"
 path = "src/bin/rfcomm_debug.rs"
 required-features = ["rfcomm"]
 
+[[bin]]
+name = "ble-probe"
+path = "src/bin/ble_probe.rs"
+required-features = ["rfcomm"]
+
 # ── Features ──────────────────────────────────────────────────────────────────
 #
 # default  — TUI only (no heavy Bluetooth deps beyond btleplug)
