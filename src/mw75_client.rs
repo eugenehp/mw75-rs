@@ -71,7 +71,7 @@ use crate::protocol::{
     BLE_EEG_COMMAND, BLE_RAW_MODE_COMMAND, BLE_SUCCESS_CODE, BLE_UNKNOWN_E0_COMMAND,
     DISABLE_EEG_CMD, DISABLE_RAW_MODE_CMD, ENABLE_EEG_CMD, ENABLE_RAW_MODE_CMD,
     MW75_COMMAND_CHAR, MW75_DEVICE_NAME_PATTERN, MW75_SERVICE_UUID, MW75_STATUS_CHAR,
-    BLE_ACTIVATION_DELAY_MS,
+    BLE_ACTIVATION_DELAY_MS, BLE_RFCOMM_STATUS_COMMAND,
 };
 use crate::types::{ActivationStatus, BatteryInfo, Mw75Event};
 
@@ -426,6 +426,9 @@ impl Mw75Client {
                         let _ = notification_tx
                             .send(Mw75Event::Battery(BatteryInfo { level }))
                             .await;
+                    } else if cmd_type == BLE_RFCOMM_STATUS_COMMAND {
+                        let state = if status == 0x00 { "not connected" } else { "connected" };
+                        debug!("RFCOMM status: 0x{status:02x} ({state})");
                     } else if cmd_type == BLE_UNKNOWN_E0_COMMAND {
                         debug!("Unknown E0 command response: status=0x{status:02x}");
                     } else {

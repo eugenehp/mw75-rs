@@ -85,23 +85,45 @@ async fn connect_and_run(
 
     // ── Data transport ──────────────────────────────────────────────────────
     //
-    // Stay on BLE and listen for data via notifications.
-    // RFCOMM can be re-enabled later once baseband connection issues are resolved.
-    // Set RFCOMM=1 environment variable to force RFCOMM mode.
+    // The device sends 0x88 heartbeats indicating RFCOMM status.
+    // Strategy:
+    //   default     — keep BLE connected, attempt RFCOMM in parallel
+    //   RFCOMM=0    — BLE-only mode (skip RFCOMM entirely)
+    //   RFCOMM=ble  — disconnect BLE first, then RFCOMM (old behavior)
     #[cfg(feature = "rfcomm")]
-    let _rfcomm_task = if std::env::var("RFCOMM").unwrap_or_default() == "1" {
-        let bt_address = handle.peripheral_id();
-        info!("RFCOMM=1: Starting RFCOMM stream to {bt_address} …");
-        handle.disconnect_ble().await.ok();
-        let rfcomm_handle = handle.clone();
-        match mw75::rfcomm::start_rfcomm_stream(rfcomm_handle, &bt_address).await {
-            Ok(task) => { info!("RFCOMM reader task started"); Some(task) }
-            Err(e) => { info!("RFCOMM failed ({e}), BLE stream active"); None }
+    let _rfcomm_task = {
+        let rfcomm_mode = std::env::var("RFCOMM").unwrap_or_default();
+        match rfcomm_mode.as_str() {
+            "0" => {
+                info!("RFCOMM=0: BLE-only mode, skipping RFCOMM");
+                None
+            }
+            "ble" => {
+                // Old behavior: disconnect BLE first
+                let bt_address = handle.peripheral_id();
+                info!("RFCOMM=ble: disconnecting BLE, then RFCOMM …");
+                handle.disconnect_ble().await.ok();
+                let rfcomm_handle = handle.clone();
+                match mw75::rfcomm::start_rfcomm_stream(rfcomm_handle, &bt_address).await {
+                    Ok(task) => { info!("RFCOMM reader task started"); Some(task) }
+                    Err(e) => { info!("RFCOMM failed ({e})"); None }
+                }
+            }
+            _ => {
+                // Default: keep BLE alive, try RFCOMM in parallel
+                let bt_address = handle.peripheral_id();
+                info!("Attempting RFCOMM (BLE stays connected) …");
+                info!("  (set RFCOMM=0 for BLE-only, RFCOMM=ble for old behavior)");
+                let rfcomm_handle = handle.clone();
+                match mw75::rfcomm::start_rfcomm_stream(rfcomm_handle, &bt_address).await {
+                    Ok(task) => { info!("RFCOMM reader task started"); Some(task) }
+                    Err(e) => {
+                        info!("RFCOMM failed ({e}), continuing with BLE notifications");
+                        None
+                    }
+                }
+            }
         }
-    } else {
-        info!("BLE-only mode: listening for EEG data on BLE notifications …");
-        info!("  (set RFCOMM=1 to force RFCOMM transport)");
-        None
     };
 
     #[cfg(not(feature = "rfcomm"))]

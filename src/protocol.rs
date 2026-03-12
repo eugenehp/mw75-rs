@@ -115,6 +115,11 @@ pub const BLE_BATTERY_COMMAND: u8 = 0x14;
 /// Unknown command byte sometimes seen in responses.
 pub const BLE_UNKNOWN_E0_COMMAND: u8 = 0xE0;
 
+/// RFCOMM connection status byte. The device sends `[09 9a 03 88 XX]`
+/// periodically after activation, where XX indicates RFCOMM state:
+/// `0x00` = not connected, `0x01` = connected (expected).
+pub const BLE_RFCOMM_STATUS_COMMAND: u8 = 0x88;
+
 // ── Device Discovery ─────────────────────────────────────────────────────────
 
 /// Device name pattern used to identify MW75 headphones during BLE scanning.
