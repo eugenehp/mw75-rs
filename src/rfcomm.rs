@@ -65,6 +65,13 @@ use tokio::task::JoinHandle;
 use crate::mw75_client::Mw75Handle;
 use crate::protocol::RFCOMM_CHANNEL;
 
+/// RFCOMM connection timeout in seconds.
+const RFCOMM_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// Read buffer size. MW75 packets are 63 bytes; RFCOMM may deliver
+/// arbitrary-sized chunks (commonly 64, 128, or up to MTU).
+const READ_BUF_SIZE: usize = 1024;
+
 /// Post-BLE-disconnect settle time in milliseconds.
 /// Required on some platforms (especially macOS) for the Bluetooth stack
 /// to release the BLE connection before RFCOMM can connect.

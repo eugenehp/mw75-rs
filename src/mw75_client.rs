@@ -55,6 +55,8 @@ use anyhow::{anyhow, Result};
 use btleplug::api::{
     Central, CentralEvent, Characteristic, Manager as _, Peripheral as _, ScanFilter, WriteType,
 };
+#[cfg(target_os = "macos")]
+use btleplug::api::CentralState;
 use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures::StreamExt;
 use log::{debug, info, warn};
@@ -66,7 +68,8 @@ use crate::protocol::{
     BATTERY_CMD, BLE_BATTERY_COMMAND, BLE_COMMAND_DELAY_MS, BLE_DISCOVERY_TIMEOUT_SECS,
     BLE_EEG_COMMAND, BLE_RAW_MODE_COMMAND, BLE_SUCCESS_CODE, BLE_UNKNOWN_E0_COMMAND,
     DISABLE_EEG_CMD, DISABLE_RAW_MODE_CMD, ENABLE_EEG_CMD, ENABLE_RAW_MODE_CMD,
-    MW75_COMMAND_CHAR, MW75_DEVICE_NAME_PATTERN, MW75_STATUS_CHAR, BLE_ACTIVATION_DELAY_MS,
+    MW75_COMMAND_CHAR, MW75_DEVICE_NAME_PATTERN, MW75_SERVICE_UUID, MW75_STATUS_CHAR,
+    BLE_ACTIVATION_DELAY_MS,
 };
 use crate::types::{ActivationStatus, BatteryInfo, Mw75Event};
 
@@ -147,34 +150,16 @@ impl Mw75Client {
             .ok_or_else(|| anyhow!("No Bluetooth adapter found"))?;
 
         #[cfg(target_os = "macos")]
-        {
-            use btleplug::api::CentralState;
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-            loop {
-                match adapter.adapter_state().await {
-                    Ok(CentralState::PoweredOn) => {
-                        info!("macOS: adapter is PoweredOn");
-                        break;
-                    }
-                    Ok(state) => {
-                        if tokio::time::Instant::now() >= deadline {
-                            warn!("macOS: adapter still in state {state:?} after 3 s — proceeding");
-                            break;
-                        }
-                        debug!("macOS: adapter state = {state:?}, waiting…");
-                    }
-                    Err(e) => {
-                        warn!("macOS: adapter_state() error: {e}");
-                        break;
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-            tokio::time::sleep(Duration::from_millis(300)).await;
-        }
+        wait_for_adapter_ready(&adapter).await;
 
         info!("scan_all: scanning for {} s …", self.config.scan_timeout_secs);
-        adapter.start_scan(ScanFilter::default()).await?;
+
+        // Use service UUID filter — on macOS CoreBluetooth this is required
+        // to discover already-paired devices that are not actively advertising.
+        let scan_filter = ScanFilter {
+            services: vec![MW75_SERVICE_UUID],
+        };
+        adapter.start_scan(scan_filter).await?;
         tokio::time::sleep(Duration::from_secs(self.config.scan_timeout_secs)).await;
         adapter.stop_scan().await.ok();
 
@@ -182,17 +167,18 @@ impl Mw75Client {
         let mut found = vec![];
         for p in adapter.peripherals().await? {
             if let Ok(Some(props)) = p.properties().await {
-                if let Some(name) = props.local_name {
-                    if name.to_uppercase().contains(&pattern) {
-                        let id = p.id().to_string();
-                        info!("scan_all: found {name}  id={id}");
-                        found.push(Mw75Device {
-                            name,
-                            id,
-                            peripheral: p,
-                            adapter: adapter.clone(),
-                        });
-                    }
+                let name = props.local_name.as_deref().unwrap_or("<no name>");
+                let id = p.id().to_string();
+                debug!("scan_all: saw peripheral: {name}  id={id}");
+                if name.to_uppercase().contains(&pattern) {
+                    let name = name.to_owned();
+                    info!("scan_all: found {name}  id={id}");
+                    found.push(Mw75Device {
+                        name,
+                        id,
+                        peripheral: p,
+                        adapter: adapter.clone(),
+                    });
                 }
             }
         }
@@ -215,6 +201,11 @@ impl Mw75Client {
     // ── Public: connect (convenience) ────────────────────────────────────────
 
     /// Scan for the first MW75 device, connect, and return an event channel.
+    ///
+    /// Uses a two-phase scan strategy:
+    /// 1. Scan with the MW75 service UUID filter (fast, works for paired devices on macOS).
+    /// 2. If that fails, retry with a generic scan (catches devices advertising without
+    ///    the service UUID in the advertisement payload).
     pub async fn connect(&self) -> Result<(mpsc::Receiver<Mw75Event>, Mw75Handle)> {
         let manager = Manager::new().await?;
         let adapters = manager.adapters().await?;
@@ -224,30 +215,33 @@ impl Mw75Client {
             .ok_or_else(|| anyhow!("No Bluetooth adapter found"))?;
 
         #[cfg(target_os = "macos")]
-        {
-            use btleplug::api::CentralState;
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-            loop {
-                match adapter.adapter_state().await {
-                    Ok(CentralState::PoweredOn) => break,
-                    Ok(_) if tokio::time::Instant::now() >= deadline => break,
-                    Ok(_) => {}
-                    Err(_) => break,
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-            tokio::time::sleep(Duration::from_millis(300)).await;
-        }
+        wait_for_adapter_ready(&adapter).await;
 
-        info!(
-            "Scanning for MW75 devices (timeout: {} s) …",
-            self.config.scan_timeout_secs
-        );
-        adapter.start_scan(ScanFilter::default()).await?;
-        let peripheral = self
-            .find_first(&adapter, &self.config.name_pattern, self.config.scan_timeout_secs)
-            .await?;
-        adapter.stop_scan().await.ok();
+        let timeout = self.config.scan_timeout_secs;
+        let pattern = &self.config.name_pattern;
+
+        // Phase 1: scan with service UUID filter
+        info!("Scanning for MW75 devices with service UUID filter (timeout: {timeout} s) …");
+        let scan_filter = ScanFilter {
+            services: vec![MW75_SERVICE_UUID],
+        };
+        adapter.start_scan(scan_filter).await?;
+        let peripheral = match self.find_first(&adapter, pattern, timeout).await {
+            Ok(p) => {
+                adapter.stop_scan().await.ok();
+                p
+            }
+            Err(_) => {
+                adapter.stop_scan().await.ok();
+
+                // Phase 2: generic scan (no service filter)
+                info!("Service-UUID scan found nothing — retrying with generic scan ({timeout} s) …");
+                adapter.start_scan(ScanFilter::default()).await?;
+                let p = self.find_first(&adapter, pattern, timeout).await?;
+                adapter.stop_scan().await.ok();
+                p
+            }
+        };
 
         let props = peripheral.properties().await?.unwrap_or_default();
         let device_name = props.local_name.unwrap_or_else(|| "Unknown".into());
@@ -402,16 +396,23 @@ impl Mw75Client {
         timeout_secs: u64,
     ) -> Result<Peripheral> {
         let upper_pattern = pattern.to_uppercase();
+        let mut logged_peripherals = std::collections::HashSet::new();
 
         let result = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
             loop {
                 let peripherals = adapter.peripherals().await.unwrap_or_default();
                 for p in peripherals {
                     if let Ok(Some(props)) = p.properties().await {
-                        if let Some(name) = &props.local_name {
-                            if name.to_uppercase().contains(&upper_pattern) {
-                                return p;
-                            }
+                        let id = p.id().to_string();
+                        let name = props.local_name.clone().unwrap_or_default();
+
+                        // Log each peripheral once for debugging
+                        if !name.is_empty() && logged_peripherals.insert(id.clone()) {
+                            debug!("find_first: saw peripheral: {name}  id={id}");
+                        }
+
+                        if name.to_uppercase().contains(&upper_pattern) {
+                            return p;
                         }
                     }
                 }
@@ -420,10 +421,46 @@ impl Mw75Client {
         })
         .await;
 
+        if result.is_err() {
+            warn!(
+                "Scan found {} named peripheral(s) but none matched '{pattern}'",
+                logged_peripherals.len()
+            );
+        }
+
         result.map_err(|_| {
             anyhow!("Timed out scanning for an MW75 device after {timeout_secs} s")
         })
     }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Wait for the macOS CoreBluetooth adapter to reach `PoweredOn` state.
+#[cfg(target_os = "macos")]
+async fn wait_for_adapter_ready(adapter: &Adapter) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        match adapter.adapter_state().await {
+            Ok(CentralState::PoweredOn) => {
+                info!("macOS: adapter is PoweredOn");
+                break;
+            }
+            Ok(state) => {
+                if tokio::time::Instant::now() >= deadline {
+                    warn!("macOS: adapter still in state {state:?} after 3 s — proceeding");
+                    break;
+                }
+                debug!("macOS: adapter state = {state:?}, waiting…");
+            }
+            Err(e) => {
+                warn!("macOS: adapter_state() error: {e}");
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
 }
 
 // ── Mw75Handle ────────────────────────────────────────────────────────────────
