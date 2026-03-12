@@ -1,11 +1,16 @@
 use std::io::{self, BufRead};
+use std::sync::Arc;
 
 use anyhow::Result;
 use log::info;
+use tokio::sync::mpsc;
 
 use mw75::mw75_client::{Mw75Client, Mw75ClientConfig};
 use mw75::protocol::EEG_CHANNEL_NAMES;
 use mw75::types::Mw75Event;
+
+/// Delay before attempting to reconnect after a disconnect.
+const RECONNECT_DELAY_SECS: u64 = 3;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -17,52 +22,10 @@ async fn main() -> Result<()> {
         scan_timeout_secs: 10,
         name_pattern: "MW75".into(),
     };
-
-    // ── Connect ───────────────────────────────────────────────────────────────
     let client = Mw75Client::new(config);
 
-    info!("Connecting to MW75 headphones …");
-    let (mut rx, handle) = client.connect().await?;
-
-    let handle = std::sync::Arc::new(handle);
-
-    // ── Start activation sequence ─────────────────────────────────────────────
-    handle.start().await?;
-    info!("Activation complete.");
-
-    // ── Start RFCOMM data stream ──────────────────────────────────────────────
-    #[cfg(feature = "rfcomm")]
-    {
-        let bt_address = handle.peripheral_id();
-        info!("Starting RFCOMM stream to {bt_address}…");
-
-        // Disconnect BLE first (required on macOS, recommended on Linux)
-        handle.disconnect_ble().await.ok();
-
-        let rfcomm_handle = handle.clone();
-        match mw75::rfcomm::start_rfcomm_stream(rfcomm_handle, &bt_address).await {
-            Ok(_task) => {
-                info!("RFCOMM reader task started");
-            }
-            Err(e) => {
-                info!("RFCOMM connect failed ({e}), falling back to feed_data mode");
-            }
-        }
-    }
-
-    #[cfg(not(feature = "rfcomm"))]
-    {
-        info!("RFCOMM feature not enabled. Waiting for data via feed_data()…");
-    }
-
-    info!("Press Ctrl-C or type 'q' + Enter to quit.\n");
-    info!("Commands (type + Enter):");
-    info!("  q  – quit");
-    info!("  s  – show stats\n");
-
-    // ── Stdin command loop ────────────────────────────────────────────────────
-    let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-
+    // ── Stdin command channel (lives across reconnects) ───────────────────────
+    let (line_tx, mut line_rx) = mpsc::unbounded_channel::<String>();
     std::thread::spawn(move || {
         let stdin = io::stdin();
         for line in stdin.lock().lines() {
@@ -77,89 +40,162 @@ async fn main() -> Result<()> {
         }
     });
 
-    let handle_cmd = std::sync::Arc::clone(&handle);
-    tokio::spawn(async move {
-        while let Some(line) = line_rx.recv().await {
-            if line.is_empty() {
-                continue;
-            }
-            match line.as_str() {
-                "q" => {
-                    info!("Quit requested.");
-                    handle_cmd.disconnect().await.ok();
-                    std::process::exit(0);
-                }
-                "s" => {
-                    let stats = handle_cmd.get_stats();
-                    info!(
-                        "Stats: {} total, {} valid, {} invalid ({:.1}% error rate)",
-                        stats.total_packets,
-                        stats.valid_packets,
-                        stats.invalid_packets,
-                        stats.error_rate()
-                    );
-                }
-                cmd => {
-                    info!("Unknown command: '{cmd}'");
-                }
-            }
-        }
-    });
-
-    // ── Main event loop ───────────────────────────────────────────────────────
-    while let Some(event) = rx.recv().await {
-        match event {
-            Mw75Event::Connected(name) => {
-                info!("✅  Connected to: {name}");
-            }
-            Mw75Event::Disconnected => {
-                info!("❌  Disconnected from device.");
+    // ── Connect / reconnect loop ──────────────────────────────────────────────
+    loop {
+        match connect_and_run(&client, &mut line_rx).await {
+            Ok(quit) if quit => {
+                info!("Quit requested — exiting.");
                 break;
             }
-            Mw75Event::Activated(status) => {
+            Ok(_) => {
+                // Disconnected — try to reconnect after a delay
                 info!(
-                    "🔋  Activated: EEG={}, Raw={}",
-                    status.eeg_enabled, status.raw_mode_enabled
+                    "Will attempt to reconnect in {RECONNECT_DELAY_SECS} s … \
+                     (press 'q' + Enter to quit)"
                 );
+                tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
             }
-            Mw75Event::Battery(bat) => {
-                info!("🔋  Battery: {}%", bat.level);
-            }
-            Mw75Event::Eeg(pkt) => {
-                let ch_summary: String = pkt
-                    .channels
-                    .iter()
-                    .enumerate()
-                    .take(4) // Show first 4 channels for brevity
-                    .map(|(i, &v)| format!("{}={:+.3}", EEG_CHANNEL_NAMES[i], v))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                println!(
-                    "[EEG] cnt={:3}  ref={:+.4}  drl={:+.4}  {ch_summary}  … µV",
-                    pkt.counter, pkt.ref_value, pkt.drl
+            Err(e) => {
+                info!(
+                    "Connection failed: {e:#} — retrying in {RECONNECT_DELAY_SECS} s …"
                 );
-            }
-            Mw75Event::RawData(data) => {
-                println!("[RAW] {} bytes", data.len());
-            }
-            Mw75Event::OtherEvent {
-                event_id,
-                counter,
-                raw,
-            } => {
-                println!(
-                    "[OTHER] event_id={event_id} counter={counter} len={}",
-                    raw.len()
-                );
+                tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
             }
         }
     }
 
-    // Print final stats
+    Ok(())
+}
+
+/// Run a single connect → activate → stream → disconnect cycle.
+///
+/// Returns `Ok(true)` if the user typed 'q' (quit), `Ok(false)` on
+/// device disconnect (caller should reconnect), or `Err` on failure.
+async fn connect_and_run(
+    client: &Mw75Client,
+    line_rx: &mut mpsc::UnboundedReceiver<String>,
+) -> Result<bool> {
+    info!("Connecting to MW75 headphones …");
+    let (mut rx, handle) = client.connect().await?;
+    let handle = Arc::new(handle);
+
+    // ── Activation ────────────────────────────────────────────────────────────
+    handle.start().await?;
+    info!("Activation complete.");
+
+    // ── RFCOMM ────────────────────────────────────────────────────────────────
+    #[cfg(feature = "rfcomm")]
+    let _rfcomm_task = {
+        let bt_address = handle.peripheral_id();
+        info!("Starting RFCOMM stream to {bt_address} …");
+
+        // Disconnect BLE first (required on macOS, recommended on Linux)
+        handle.disconnect_ble().await.ok();
+
+        let rfcomm_handle = handle.clone();
+        match mw75::rfcomm::start_rfcomm_stream(rfcomm_handle, &bt_address).await {
+            Ok(task) => {
+                info!("RFCOMM reader task started");
+                Some(task)
+            }
+            Err(e) => {
+                info!("RFCOMM connect failed ({e}), falling back to feed_data mode");
+                None
+            }
+        }
+    };
+
+    #[cfg(not(feature = "rfcomm"))]
+    info!("RFCOMM feature not enabled. Waiting for data via feed_data() …");
+
+    info!("Press Ctrl-C or type 'q' + Enter to quit.\n");
+    info!("Commands: q = quit, s = stats\n");
+
+    // ── Event loop ────────────────────────────────────────────────────────────
+    let mut quit = false;
+
+    loop {
+        tokio::select! {
+            event = rx.recv() => {
+                match event {
+                    Some(Mw75Event::Connected(name)) => {
+                        info!("✅  Connected to: {name}");
+                    }
+                    Some(Mw75Event::Disconnected) => {
+                        info!("❌  Disconnected from device.");
+                        break;
+                    }
+                    Some(Mw75Event::Activated(status)) => {
+                        info!(
+                            "🔋  Activated: EEG={}, Raw={}",
+                            status.eeg_enabled, status.raw_mode_enabled
+                        );
+                    }
+                    Some(Mw75Event::Battery(bat)) => {
+                        info!("🔋  Battery: {}%", bat.level);
+                    }
+                    Some(Mw75Event::Eeg(pkt)) => {
+                        let ch_summary: String = pkt
+                            .channels
+                            .iter()
+                            .enumerate()
+                            .take(4)
+                            .map(|(i, &v)| format!("{}={:+.3}", EEG_CHANNEL_NAMES[i], v))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        println!(
+                            "[EEG] cnt={:3}  ref={:+.4}  drl={:+.4}  {ch_summary}  … µV",
+                            pkt.counter, pkt.ref_value, pkt.drl
+                        );
+                    }
+                    Some(Mw75Event::RawData(data)) => {
+                        println!("[RAW] {} bytes", data.len());
+                    }
+                    Some(Mw75Event::OtherEvent { event_id, counter, raw }) => {
+                        println!(
+                            "[OTHER] event_id={event_id} counter={counter} len={}",
+                            raw.len()
+                        );
+                    }
+                    None => {
+                        // Channel closed — all senders dropped
+                        info!("Event channel closed.");
+                        break;
+                    }
+                }
+            }
+            line = line_rx.recv() => {
+                match line.as_deref() {
+                    Some("q") => {
+                        info!("Quit requested.");
+                        handle.disconnect().await.ok();
+                        quit = true;
+                        break;
+                    }
+                    Some("s") => {
+                        let stats = handle.get_stats();
+                        info!(
+                            "Stats: {} total, {} valid, {} invalid ({:.1}% error rate)",
+                            stats.total_packets,
+                            stats.valid_packets,
+                            stats.invalid_packets,
+                            stats.error_rate()
+                        );
+                    }
+                    Some(cmd) if !cmd.is_empty() => {
+                        info!("Unknown command: '{cmd}'");
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Print final stats for this session
     let stats = handle.get_stats();
     if stats.total_packets > 0 {
         info!(
-            "Final Stats: {} packets, {} valid ({:.1}%), {} invalid ({:.1}%)",
+            "Session stats: {} packets, {} valid ({:.1}%), {} invalid ({:.1}%)",
             stats.total_packets,
             stats.valid_packets,
             100.0 - stats.error_rate(),
@@ -168,6 +204,5 @@ async fn main() -> Result<()> {
         );
     }
 
-    info!("Event loop finished – exiting.");
-    Ok(())
+    Ok(quit)
 }
