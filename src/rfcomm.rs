@@ -60,19 +60,10 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use log::{debug, error, info};
-#[cfg(not(target_os = "linux"))]
-use log::warn;
 use tokio::task::JoinHandle;
 
 use crate::mw75_client::Mw75Handle;
 use crate::protocol::RFCOMM_CHANNEL;
-
-/// RFCOMM connection timeout in seconds.
-const RFCOMM_CONNECT_TIMEOUT_SECS: u64 = 10;
-
-/// Read buffer size. MW75 packets are 63 bytes; RFCOMM may deliver
-/// arbitrary-sized chunks (commonly 64, 128, or up to MTU).
-const READ_BUF_SIZE: usize = 1024;
 
 /// Post-BLE-disconnect settle time in milliseconds.
 /// Required on some platforms (especially macOS) for the Bluetooth stack
@@ -379,8 +370,8 @@ fn macos_rfcomm_thread_by_name(
     let result: i32 = unsafe {
         msg_send![
             &*device,
-            openRFCOMMChannelSync: &mut channel_ptr
-            withChannelID: RFCOMM_CHANNEL as u8
+            openRFCOMMChannelSync: &mut channel_ptr,
+            withChannelID: RFCOMM_CHANNEL as u8,
             delegate: std::ptr::null::<AnyObject>()
         ]
     };
@@ -404,11 +395,11 @@ fn macos_rfcomm_thread_by_name(
     // for rfcommChannelData:data:length: callbacks. This is complex with objc2.
     // For now, we use the synchronous read approach with NSRunLoop pumping.
 
-    let runloop = unsafe { NSRunLoop::currentRunLoop() };
+    let runloop = NSRunLoop::currentRunLoop();
     loop {
         // Pump the runloop for 1ms
-        let date = unsafe { NSDate::dateWithTimeIntervalSinceNow(0.001) };
-        unsafe { runloop.runUntilDate(&date) };
+        let date = NSDate::dateWithTimeIntervalSinceNow(0.001);
+        runloop.runUntilDate(&date);
 
         // Check if channel is still open
         let is_open: bool = unsafe { msg_send![channel_ptr, isOpen] };
