@@ -387,6 +387,7 @@ impl Mw75Client {
             command_char,
             processor: std::sync::Mutex::new(PacketProcessor::new(false)),
             tx,
+            device_name: device_name.clone(),
         };
 
         Ok((rx, handle))
@@ -433,6 +434,7 @@ pub struct Mw75Handle {
     command_char: Characteristic,
     processor: std::sync::Mutex<PacketProcessor>,
     tx: mpsc::Sender<Mw75Event>,
+    device_name: String,
 }
 
 impl Mw75Handle {
@@ -548,6 +550,11 @@ impl Mw75Handle {
     /// On macOS, this is a UUID string.
     pub fn peripheral_id(&self) -> String {
         self.peripheral.id().to_string()
+    }
+
+    /// Get the advertised device name (e.g. `"MW75 Neuro"`).
+    pub fn device_name(&self) -> &str {
+        &self.device_name
     }
 
     /// Disconnect the BLE link only (keeping the handle alive for RFCOMM).

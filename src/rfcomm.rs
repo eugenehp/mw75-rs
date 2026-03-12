@@ -107,6 +107,7 @@ pub async fn start_rfcomm_stream(
     address: &str,
 ) -> Result<JoinHandle<()>> {
     let address = address.to_string();
+    let device_name = handle.device_name().to_string();
 
     info!("Starting RFCOMM stream to {address} on channel {RFCOMM_CHANNEL}");
 
@@ -114,7 +115,7 @@ pub async fn start_rfcomm_stream(
     tokio::time::sleep(std::time::Duration::from_millis(BLE_SETTLE_MS)).await;
 
     let task = tokio::spawn(async move {
-        match rfcomm_reader_loop(&handle, &address).await {
+        match rfcomm_reader_loop(&handle, &address, &device_name).await {
             Ok(()) => {
                 info!("RFCOMM stream ended normally");
             }
@@ -151,7 +152,7 @@ fn parse_mac(s: &str) -> Result<[u8; 6]> {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[cfg(target_os = "linux")]
-async fn rfcomm_reader_loop(handle: &Mw75Handle, address: &str) -> Result<()> {
+async fn rfcomm_reader_loop(handle: &Mw75Handle, address: &str, _device_name: &str) -> Result<()> {
     use bluer::rfcomm::{SocketAddr, Stream};
     use bluer::Address;
     use tokio::io::AsyncReadExt;
@@ -212,10 +213,12 @@ async fn rfcomm_reader_loop(handle: &Mw75Handle, address: &str) -> Result<()> {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[cfg(target_os = "macos")]
-async fn rfcomm_reader_loop(handle: &Mw75Handle, address: &str) -> Result<()> {
+async fn rfcomm_reader_loop(handle: &Mw75Handle, address: &str, device_name: &str) -> Result<()> {
     use std::sync::mpsc as std_mpsc;
 
-    let mac_bytes = parse_mac(address)?;
+    // On macOS, CoreBluetooth (btleplug) returns a UUID, not a MAC address.
+    // We look up the IOBluetooth device by name instead.
+    let name_owned = device_name.to_string();
 
     // IOBluetooth must run on a thread with an NSRunLoop.
     // We spawn a dedicated thread and communicate via a channel.
@@ -225,7 +228,7 @@ async fn rfcomm_reader_loop(handle: &Mw75Handle, address: &str) -> Result<()> {
     let address_owned = address.to_string();
 
     std::thread::spawn(move || {
-        macos_rfcomm_thread(mac_bytes, data_tx, status_tx, address_owned);
+        macos_rfcomm_thread_by_name(&name_owned, data_tx, status_tx, address_owned);
     });
 
     // Wait for connection status
@@ -270,8 +273,8 @@ async fn rfcomm_reader_loop(handle: &Mw75Handle, address: &str) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_rfcomm_thread(
-    mac_bytes: [u8; 6],
+fn macos_rfcomm_thread_by_name(
+    device_name: &str,
     data_tx: std::sync::mpsc::Sender<Vec<u8>>,
     status_tx: tokio::sync::mpsc::Sender<Result<()>>,
     address: String,
@@ -279,30 +282,94 @@ fn macos_rfcomm_thread(
     use objc2::rc::Retained;
     use objc2::runtime::AnyObject;
     use objc2::{msg_send, ClassType};
-    use objc2_foundation::{NSDate, NSRunLoop, NSString};
+    use objc2_foundation::{NSArray, NSDate, NSRunLoop, NSString};
     use objc2_io_bluetooth::IOBluetoothDevice;
 
-    // Construct a BluetoothDeviceAddress struct (6 bytes)
-    // IOBluetoothDevice expects the address as a string "AA-BB-CC-DD-EE-FF"
-    let addr_str = format!(
-        "{:02X}-{:02X}-{:02X}-{:02X}-{:02X}-{:02X}",
-        mac_bytes[0], mac_bytes[1], mac_bytes[2],
-        mac_bytes[3], mac_bytes[4], mac_bytes[5]
-    );
+    // On macOS, CoreBluetooth returns UUIDs, not MAC addresses.
+    // We look up the IOBluetooth device by scanning paired/recent devices
+    // and matching by name.
+    info!("macOS RFCOMM: looking up IOBluetooth device by name '{device_name}'…");
 
-    // Get device by address
-    let ns_addr = NSString::from_str(&addr_str);
+    // Try pairedDevices first, then recentDevices
     let device: Option<Retained<IOBluetoothDevice>> = unsafe {
-        msg_send![IOBluetoothDevice::class(), deviceWithAddressString: &*ns_addr]
+        // pairedDevices returns an NSArray of IOBluetoothDevice
+        let paired: Option<Retained<NSArray<IOBluetoothDevice>>> =
+            msg_send![IOBluetoothDevice::class(), pairedDevices];
+
+        let mut found: Option<Retained<IOBluetoothDevice>> = None;
+
+        if let Some(ref devices) = paired {
+            let count: usize = msg_send![devices, count];
+            for i in 0..count {
+                let dev: Retained<IOBluetoothDevice> = msg_send![devices, objectAtIndex: i];
+                let name_ptr: *const NSString = msg_send![&*dev, name];
+                if !name_ptr.is_null() {
+                    let ns_name: &NSString = &*name_ptr;
+                    let name_str = ns_name.to_string();
+                    debug!("macOS RFCOMM: paired device: {name_str}");
+                    if name_str == device_name {
+                        found = Some(dev);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Also try recentDevices if not found in paired
+        if found.is_none() {
+            let recent: Option<Retained<NSArray<IOBluetoothDevice>>> =
+                msg_send![IOBluetoothDevice::class(), recentDevices: 10usize];
+            if let Some(ref devices) = recent {
+                let count: usize = msg_send![devices, count];
+                for i in 0..count {
+                    let dev: Retained<IOBluetoothDevice> = msg_send![devices, objectAtIndex: i];
+                    let name_ptr: *const NSString = msg_send![&*dev, name];
+                    if !name_ptr.is_null() {
+                        let ns_name: &NSString = &*name_ptr;
+                        let name_str = ns_name.to_string();
+                        debug!("macOS RFCOMM: recent device: {name_str}");
+                        if name_str == device_name {
+                            found = Some(dev);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        found
     };
 
     let device = match device {
         Some(d) => d,
         None => {
-            let _ = status_tx.blocking_send(Err(anyhow!(
-                "macOS: IOBluetoothDevice not found for address {address}"
-            )));
-            return;
+            // If we can't find by name, try parsing as MAC as a fallback
+            if let Ok(mac_bytes) = parse_mac(&address) {
+                let addr_str = format!(
+                    "{:02X}-{:02X}-{:02X}-{:02X}-{:02X}-{:02X}",
+                    mac_bytes[0], mac_bytes[1], mac_bytes[2],
+                    mac_bytes[3], mac_bytes[4], mac_bytes[5]
+                );
+                let ns_addr = NSString::from_str(&addr_str);
+                let dev: Option<Retained<IOBluetoothDevice>> = unsafe {
+                    msg_send![IOBluetoothDevice::class(), deviceWithAddressString: &*ns_addr]
+                };
+                match dev {
+                    Some(d) => d,
+                    None => {
+                        let _ = status_tx.blocking_send(Err(anyhow!(
+                            "macOS: IOBluetoothDevice not found by name '{device_name}' or address '{address}'"
+                        )));
+                        return;
+                    }
+                }
+            } else {
+                let _ = status_tx.blocking_send(Err(anyhow!(
+                    "macOS: IOBluetoothDevice not found by name '{device_name}' \
+                     (peripheral ID '{address}' is a CoreBluetooth UUID, not a MAC address)"
+                )));
+                return;
+            }
         }
     };
 
@@ -363,7 +430,7 @@ fn macos_rfcomm_thread(
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[cfg(target_os = "windows")]
-async fn rfcomm_reader_loop(handle: &Mw75Handle, address: &str) -> Result<()> {
+async fn rfcomm_reader_loop(handle: &Mw75Handle, address: &str, _device_name: &str) -> Result<()> {
     use windows::Devices::Bluetooth::Rfcomm::RfcommDeviceService;
     use windows::Devices::Bluetooth::BluetoothDevice;
     use windows::Networking::Sockets::StreamSocket;
@@ -486,7 +553,7 @@ async fn rfcomm_reader_loop(handle: &Mw75Handle, address: &str) -> Result<()> {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-async fn rfcomm_reader_loop(_handle: &Mw75Handle, address: &str) -> Result<()> {
+async fn rfcomm_reader_loop(_handle: &Mw75Handle, address: &str, _device_name: &str) -> Result<()> {
     Err(anyhow!(
         "RFCOMM is not supported on this platform. \
          Use Mw75Handle::feed_data() to push raw bytes from an external transport."
