@@ -49,6 +49,8 @@
 //! ```
 
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -219,10 +221,8 @@ impl Mw75Client {
 
     /// Scan for the first MW75 device, connect, and return an event channel.
     ///
-    /// Uses a two-phase scan strategy:
-    /// 1. Scan with the MW75 service UUID filter (fast, works for paired devices on macOS).
-    /// 2. If that fails, retry with a generic scan (catches devices advertising without
-    ///    the service UUID in the advertisement payload).
+    /// Starts a generic BLE scan (no service filter) and matches peripherals
+    /// by name, service UUID, or manufacturer data.
     pub async fn connect(&self) -> Result<(mpsc::Receiver<Mw75Event>, Mw75Handle)> {
         let manager = Manager::new().await?;
         let adapters = manager.adapters().await?;
@@ -237,28 +237,10 @@ impl Mw75Client {
         let timeout = self.config.scan_timeout_secs;
         let pattern = &self.config.name_pattern;
 
-        // Phase 1: scan with service UUID filter
-        info!("Scanning for MW75 devices with service UUID filter (timeout: {timeout} s) …");
-        let scan_filter = ScanFilter {
-            services: vec![MW75_SERVICE_UUID],
-        };
-        adapter.start_scan(scan_filter).await?;
-        let peripheral = match self.find_first(&adapter, pattern, timeout).await {
-            Ok(p) => {
-                adapter.stop_scan().await.ok();
-                p
-            }
-            Err(_) => {
-                adapter.stop_scan().await.ok();
-
-                // Phase 2: generic scan (no service filter)
-                info!("Service-UUID scan found nothing — retrying with generic scan ({timeout} s) …");
-                adapter.start_scan(ScanFilter::default()).await?;
-                let p = self.find_first(&adapter, pattern, timeout).await?;
-                adapter.stop_scan().await.ok();
-                p
-            }
-        };
+        info!("Scanning for MW75 devices (timeout: {timeout} s) …");
+        adapter.start_scan(ScanFilter::default()).await?;
+        let peripheral = self.find_first(&adapter, pattern, timeout).await?;
+        adapter.stop_scan().await.ok();
 
         let props = peripheral.properties().await?.unwrap_or_default();
         let device_name = props
@@ -313,17 +295,25 @@ impl Mw75Client {
         let (tx, rx) = mpsc::channel::<Mw75Event>(256);
         let _ = tx.send(Mw75Event::Connected(device_name.clone())).await;
 
+        // Shared flag: set before intentional BLE disconnects (e.g. pre-RFCOMM)
+        let ble_disconnect_expected = Arc::new(AtomicBool::new(false));
+
         // Disconnect watcher
         let disconnect_tx = tx.clone();
         let peripheral_id = peripheral.id();
+        let expected_flag = ble_disconnect_expected.clone();
         tokio::spawn(async move {
             match adapter.events().await {
                 Ok(mut events) => {
                     while let Some(event) = events.next().await {
                         if let CentralEvent::DeviceDisconnected(id) = event {
                             if id == peripheral_id {
-                                info!("Disconnect watcher: MW75 disconnected");
-                                let _ = disconnect_tx.send(Mw75Event::Disconnected).await;
+                                if expected_flag.load(Ordering::SeqCst) {
+                                    info!("Disconnect watcher: BLE disconnect expected (pre-RFCOMM), suppressing event");
+                                } else {
+                                    info!("Disconnect watcher: MW75 disconnected unexpectedly");
+                                    let _ = disconnect_tx.send(Mw75Event::Disconnected).await;
+                                }
                                 break;
                             }
                         }
@@ -338,6 +328,7 @@ impl Mw75Client {
         // Spawn notification handler for BLE status responses
         let notification_tx = tx.clone();
         let peripheral_clone = peripheral.clone();
+        let expected_flag2 = ble_disconnect_expected.clone();
         tokio::spawn(async move {
             let mut notifications = match peripheral_clone.notifications().await {
                 Ok(n) => n,
@@ -351,48 +342,42 @@ impl Mw75Client {
             while let Some(notif) = notifications.next().await {
                 let data = &notif.value;
 
+                let hex: String = data.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+                debug!("BLE notification ({} bytes): {hex}", data.len());
+
                 if data.len() >= 5 {
                     let cmd_type = data[3];
                     let status = data[4];
-                    debug!(
-                        "BLE response: cmd=0x{:02x} status=0x{:02x}",
-                        cmd_type, status
-                    );
 
                     if cmd_type == BLE_EEG_COMMAND && status == BLE_SUCCESS_CODE {
                         info!("EEG mode confirmed enabled");
                     } else if cmd_type == BLE_RAW_MODE_COMMAND && status == BLE_SUCCESS_CODE {
                         info!("Raw mode confirmed enabled");
-                    } else if cmd_type == BLE_BATTERY_COMMAND && status == BLE_SUCCESS_CODE {
-                        if data.len() >= 6 {
-                            let level = data[5];
-                            info!("Battery level: {level}%");
-                            let _ = notification_tx
-                                .send(Mw75Event::Battery(BatteryInfo { level }))
-                                .await;
-                        }
-                    } else if cmd_type == BLE_SUCCESS_CODE {
-                        // Alternative battery response format
-                        if data[0] == 0x09 && data[1] == 0x9A && data[2] == 0x03 {
-                            let level = status;
-                            info!("Battery level: {level}%");
-                            let _ = notification_tx
-                                .send(Mw75Event::Battery(BatteryInfo { level }))
-                                .await;
-                        }
+                    } else if cmd_type == BLE_BATTERY_COMMAND {
+                        // Battery response: [09 9A 03 14 F1 level] or [09 9A 03 14 level]
+                        let level = if status == BLE_SUCCESS_CODE && data.len() >= 6 {
+                            data[5]
+                        } else {
+                            status
+                        };
+                        info!("Battery level: {level}%");
+                        let _ = notification_tx
+                            .send(Mw75Event::Battery(BatteryInfo { level }))
+                            .await;
                     } else if cmd_type == BLE_UNKNOWN_E0_COMMAND {
                         debug!("Unknown E0 command response: status=0x{status:02x}");
                     } else {
-                        warn!(
-                            "Unexpected BLE response: cmd=0x{:02x} status=0x{:02x}",
-                            cmd_type, status
+                        debug!(
+                            "Unrecognised BLE response: cmd=0x{cmd_type:02x} status=0x{status:02x}"
                         );
                     }
                 }
             }
 
             info!("BLE notification stream ended");
-            let _ = notification_tx.send(Mw75Event::Disconnected).await;
+            if !expected_flag2.load(Ordering::SeqCst) {
+                let _ = notification_tx.send(Mw75Event::Disconnected).await;
+            }
         });
 
         let handle = Mw75Handle {
@@ -401,6 +386,7 @@ impl Mw75Client {
             processor: std::sync::Mutex::new(PacketProcessor::new(false)),
             tx,
             device_name: device_name.clone(),
+            ble_disconnect_expected,
         };
 
         Ok((rx, handle))
@@ -545,6 +531,10 @@ pub struct Mw75Handle {
     processor: std::sync::Mutex<PacketProcessor>,
     tx: mpsc::Sender<Mw75Event>,
     device_name: String,
+    /// Set to `true` before an intentional BLE disconnect (e.g. pre-RFCOMM)
+    /// so the disconnect watcher and notification handler don't fire a
+    /// spurious `Mw75Event::Disconnected`.
+    ble_disconnect_expected: Arc<AtomicBool>,
 }
 
 impl Mw75Handle {
@@ -671,8 +661,14 @@ impl Mw75Handle {
     ///
     /// On macOS, the BLE connection must be dropped before RFCOMM can connect.
     /// This disconnects BLE without sending disable commands.
+    ///
+    /// The disconnect watcher and notification handler will **not** emit
+    /// `Mw75Event::Disconnected` — the flag is set before the disconnect so
+    /// downstream consumers know the session is still alive (transitioning to
+    /// RFCOMM).
     pub async fn disconnect_ble(&self) -> Result<()> {
         info!("Disconnecting BLE (pre-RFCOMM)…");
+        self.ble_disconnect_expected.store(true, Ordering::SeqCst);
         self.peripheral.disconnect().await?;
         info!("BLE disconnected");
         Ok(())
