@@ -394,109 +394,72 @@ fn macos_rfcomm_thread_by_name(
         }
     }
 
-    // ── Step 2: Ensure Classic BT baseband connection ─────────────────────────
-    //
-    // IOBluetooth's openRFCOMMChannelSync *should* establish the baseband
-    // connection automatically, but on recent macOS versions (especially after
-    // a BLE disconnect) an explicit openConnection + SDP query helps the
-    // Bluetooth stack realize the device is reachable over Classic BT.
-    //
-    // IMPORTANT: Both `openConnection` and `performSDPQuery:` are asynchronous
-    // on modern macOS — they return immediately and deliver results via the
-    // NSRunLoop. We must pump the run loop to let them complete.
+    // ── Step 2: Connection state and SDP ──────────────────────────────────────
 
     let runloop = NSRunLoop::currentRunLoop();
 
     let is_connected: bool = unsafe { msg_send![&*device, isConnected] };
-    info!("macOS RFCOMM: device isConnected = {is_connected}");
+    info!("macOS: device isConnected = {is_connected}");
 
+    // Check if Classic BT ACL link exists (vs just BLE)
+    // Try explicit openConnection regardless — if already connected it's a no-op
     if !is_connected {
-        info!("macOS RFCOMM: opening baseband connection …");
-        let connect_result: i32 = unsafe { msg_send![&*device, openConnection] };
-        if connect_result != 0 {
-            info!(
-                "macOS RFCOMM: openConnection returned 0x{connect_result:08x} \
-                 (may still succeed via openRFCOMMChannelSync)"
-            );
-        } else {
-            info!("macOS RFCOMM: openConnection initiated (status=0)");
+        info!("macOS: opening baseband connection …");
+        let r: i32 = unsafe { msg_send![&*device, openConnection] };
+        info!("macOS: openConnection returned 0x{r:08x}");
+        // Wait with thread::sleep (run loop may have no sources)
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let c: bool = unsafe { msg_send![&*device, isConnected] };
+            if c { info!("macOS: baseband connected"); break; }
         }
+    }
 
-        // Pump the run loop to let the baseband connection establish
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let date = NSDate::dateWithTimeIntervalSinceNow(0.1);
-            runloop.runUntilDate(&date);
+    // SDP query (results are likely cached for paired devices)
+    info!("macOS: performing SDP query …");
+    let _: i32 = unsafe { msg_send![&*device, performSDPQuery: std::ptr::null::<AnyObject>()] };
+    std::thread::sleep(std::time::Duration::from_secs(2));
 
-            let connected: bool = unsafe { msg_send![&*device, isConnected] };
-            if connected {
-                info!("macOS RFCOMM: baseband connection established");
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                info!(
-                    "macOS RFCOMM: baseband connection timeout (5 s), \
-                     continuing anyway …"
-                );
-                break;
+    // Enumerate SDP service records to find available channels
+    let mut rfcomm_channels: Vec<u8> = Vec::new();
+    let mut l2cap_psms: Vec<u16> = Vec::new();
+    unsafe {
+        let services: *const AnyObject = msg_send![&*device, services];
+        if !services.is_null() {
+            let count: usize = msg_send![services, count];
+            info!("macOS: {count} SDP service record(s):");
+            for i in 0..count {
+                let rec: *const AnyObject = msg_send![services, objectAtIndex: i];
+                let svc_name_ptr: *const NSString = msg_send![rec, getServiceName];
+                let svc_name = if !svc_name_ptr.is_null() { (*svc_name_ptr).to_string() } else { "<unnamed>".into() };
+
+                let mut ch: u8 = 0;
+                let ch_r: i32 = msg_send![rec, getRFCOMMChannelID: &mut ch as *mut u8];
+                let mut psm: u16 = 0;
+                let psm_r: i32 = msg_send![rec, getL2CAPPSM: &mut psm as *mut u16];
+
+                let rfcomm_s = if ch_r == 0 { rfcomm_channels.push(ch); format!("RFCOMM={ch}") } else { String::new() };
+                let l2cap_s = if psm_r == 0 { l2cap_psms.push(psm); format!("L2CAP={psm}") } else { String::new() };
+                info!("macOS:   [{i}] {svc_name:35} {rfcomm_s:12} {l2cap_s}");
             }
         }
     }
 
-    // ── Step 3: SDP query to let the stack discover RFCOMM services ───────────
+    // ── Step 3: Try all transport strategies ──────────────────────────────────
     //
-    // `performSDPQuery:` is async since macOS 10.7 — we must run the
-    // NSRunLoop to process the response.  We poll for service records
-    // to appear on the device.
-
-    info!("macOS RFCOMM: performing SDP query …");
-    let sdp_result: i32 = unsafe {
-        msg_send![&*device, performSDPQuery: std::ptr::null::<AnyObject>()]
-    };
-    if sdp_result != 0 {
-        info!(
-            "macOS RFCOMM: SDP query returned 0x{sdp_result:08x} (non-fatal, continuing)"
-        );
-    } else {
-        info!("macOS RFCOMM: SDP query initiated …");
-        // Pump the run loop to let SDP results arrive
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let mut services_found = false;
-        loop {
-            let date = NSDate::dateWithTimeIntervalSinceNow(0.1);
-            runloop.runUntilDate(&date);
-
-            // Check if the device now has service records
-            let services: *const AnyObject = unsafe { msg_send![&*device, services] };
-            if !services.is_null() {
-                let count: usize = unsafe { msg_send![services, count] };
-                if count > 0 {
-                    info!("macOS RFCOMM: SDP query complete — {count} service record(s)");
-                    services_found = true;
-                    break;
-                }
-            }
-
-            if std::time::Instant::now() >= deadline {
-                info!("macOS RFCOMM: SDP query timeout (5 s), continuing …");
-                break;
-            }
-        }
-        if !services_found {
-            // Extra settle time if SDP didn't return services
-            let date = NSDate::dateWithTimeIntervalSinceNow(1.0);
-            runloop.runUntilDate(&date);
-        }
-    }
-
-    // ── Step 4: Open RFCOMM channel with retries ──────────────────────────────
+    // Strategy A: RFCOMM on channel 25 (primary)
+    // Strategy B: L2CAP PSM 25 (alternative transport for same service)
+    // Strategy C: RFCOMM on other discovered channels
+    // Strategy D: RFCOMM on channel 2 (GAIA)
 
     let mut channel_ptr: *mut AnyObject = std::ptr::null_mut();
-    let mut last_result: i32 = 0;
+    let mut transport_type = "";
 
-    for attempt in 1..=MACOS_RFCOMM_MAX_RETRIES {
+    // ── Strategy A: RFCOMM channel 25 ─────────────────────────────────────────
+    info!("macOS: ── Strategy A: RFCOMM channel {RFCOMM_CHANNEL} ──");
+    for attempt in 1..=3u32 {
         channel_ptr = std::ptr::null_mut();
-        last_result = unsafe {
+        let r: i32 = unsafe {
             msg_send![
                 &*device,
                 openRFCOMMChannelSync: &mut channel_ptr,
@@ -504,52 +467,111 @@ fn macos_rfcomm_thread_by_name(
                 delegate: std::ptr::null::<AnyObject>()
             ]
         };
-
-        if last_result == 0 && !channel_ptr.is_null() {
-            info!("macOS RFCOMM: channel {RFCOMM_CHANNEL} opened on attempt {attempt}");
+        if r == 0 && !channel_ptr.is_null() {
+            info!("macOS: ✅ RFCOMM channel {RFCOMM_CHANNEL} opened!");
+            transport_type = "RFCOMM";
             break;
         }
+        let err_name = if r as u32 == 0xe00002bc { "kIOReturnNotPermitted" } else { "?" };
+        info!("macOS: RFCOMM ch {RFCOMM_CHANNEL} attempt {attempt}/3: 0x{r:08x} ({err_name})");
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
 
-        if attempt < MACOS_RFCOMM_MAX_RETRIES {
-            let delay_ms = MACOS_RFCOMM_RETRY_BASE_MS * attempt as u64;
-            info!(
-                "macOS RFCOMM: openRFCOMMChannelSync failed (0x{last_result:08x}), \
-                 retrying in {delay_ms} ms ({attempt}/{MACOS_RFCOMM_MAX_RETRIES}) …"
-            );
-            // Pump the run loop during the retry delay instead of sleeping,
-            // so the Bluetooth stack can process pending events.
-            let date = NSDate::dateWithTimeIntervalSinceNow(delay_ms as f64 / 1000.0);
-            runloop.runUntilDate(&date);
+    // ── Strategy B: L2CAP PSM 25 ──────────────────────────────────────────────
+    if transport_type.is_empty() {
+        info!("macOS: ── Strategy B: L2CAP PSM 25 ──");
+        let mut l2cap_ch: *mut AnyObject = std::ptr::null_mut();
+        let r: i32 = unsafe {
+            msg_send![
+                &*device,
+                openL2CAPChannelSync: &mut l2cap_ch,
+                withPSM: 25u16,
+                delegate: std::ptr::null::<AnyObject>()
+            ]
+        };
+        if r == 0 && !l2cap_ch.is_null() {
+            info!("macOS: ✅ L2CAP PSM 25 opened!");
+            channel_ptr = l2cap_ch;
+            transport_type = "L2CAP";
+        } else {
+            let err_name = if r as u32 == 0xe00002bc { "kIOReturnNotPermitted" } else { "?" };
+            info!("macOS: L2CAP PSM 25 failed: 0x{r:08x} ({err_name})");
         }
     }
 
-    if last_result != 0 || channel_ptr.is_null() {
+    // ── Strategy C: Try all other discovered RFCOMM channels ──────────────────
+    if transport_type.is_empty() {
+        for &ch in &rfcomm_channels {
+            if ch == RFCOMM_CHANNEL { continue; }
+            info!("macOS: ── Strategy C: RFCOMM channel {ch} ──");
+            channel_ptr = std::ptr::null_mut();
+            let r: i32 = unsafe {
+                msg_send![
+                    &*device,
+                    openRFCOMMChannelSync: &mut channel_ptr,
+                    withChannelID: ch,
+                    delegate: std::ptr::null::<AnyObject>()
+                ]
+            };
+            if r == 0 && !channel_ptr.is_null() {
+                info!("macOS: ✅ RFCOMM channel {ch} opened!");
+                transport_type = "RFCOMM";
+                break;
+            }
+            let err_name = if r as u32 == 0xe00002bc { "kIOReturnNotPermitted" } else { "?" };
+            info!("macOS: RFCOMM ch {ch} failed: 0x{r:08x} ({err_name})");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    }
+
+    // ── Strategy D: Try all discovered L2CAP PSMs ─────────────────────────────
+    if transport_type.is_empty() {
+        for &psm in &l2cap_psms {
+            if psm == 25 { continue; }
+            info!("macOS: ── Strategy D: L2CAP PSM {psm} ──");
+            let mut l2cap_ch: *mut AnyObject = std::ptr::null_mut();
+            let r: i32 = unsafe {
+                msg_send![
+                    &*device,
+                    openL2CAPChannelSync: &mut l2cap_ch,
+                    withPSM: psm,
+                    delegate: std::ptr::null::<AnyObject>()
+                ]
+            };
+            if r == 0 && !l2cap_ch.is_null() {
+                info!("macOS: ✅ L2CAP PSM {psm} opened!");
+                channel_ptr = l2cap_ch;
+                transport_type = "L2CAP";
+                break;
+            }
+            let err_name = if r as u32 == 0xe00002bc { "kIOReturnNotPermitted" } else { "?" };
+            info!("macOS: L2CAP PSM {psm} failed: 0x{r:08x} ({err_name})");
+        }
+    }
+
+    if transport_type.is_empty() {
         let _ = status_tx.blocking_send(Err(anyhow!(
-            "macOS: RFCOMM channel {RFCOMM_CHANNEL} open failed after \
-             {MACOS_RFCOMM_MAX_RETRIES} attempts (last status=0x{last_result:08x})"
+            "macOS: all RFCOMM/L2CAP channel open strategies failed (last=0xe00002bc). \
+             RFCOMM channels tried: {rfcomm_channels:?}, L2CAP PSMs tried: {l2cap_psms:?}"
         )));
         return;
     }
 
-    // ── Step 5: Connected — notify caller and pump NSRunLoop ──────────────────
+    // ── Step 4: Connected — notify caller and pump NSRunLoop ──────────────────
 
+    info!("macOS: {transport_type} channel connected, starting data loop");
     let _ = status_tx.blocking_send(Ok(()));
 
-    // IOBluetooth delivers data via delegate callbacks on the NSRunLoop.
-    // Without a delegate, we keep the runloop alive so that when a proper
-    // delegate is wired up, callbacks will be delivered.
-    //
-    // TODO: implement an NSObject subclass that conforms to
-    // IOBluetoothRFCOMMChannelDelegate and forwards
-    // rfcommChannelData:data:length: into `data_tx`.
-
+    // Pump NSRunLoop to receive delegate callbacks.
+    // TODO: implement IOBluetoothRFCOMMChannelDelegate / IOBluetoothL2CAPChannelDelegate
+    // to actually receive data via `data_tx`.
     loop {
         let date = NSDate::dateWithTimeIntervalSinceNow(0.1);
         runloop.runUntilDate(&date);
 
         let is_open: bool = unsafe { msg_send![channel_ptr, isOpen] };
         if !is_open {
-            info!("macOS RFCOMM: channel closed");
+            info!("macOS: {transport_type} channel closed");
             let _ = data_tx.send(Vec::new());
             break;
         }
