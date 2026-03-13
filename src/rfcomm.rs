@@ -79,15 +79,7 @@ const READ_BUF_SIZE: usize = 1024;
 /// to release the BLE connection before RFCOMM can connect.
 const BLE_SETTLE_MS: u64 = 1000;
 
-/// Maximum number of RFCOMM connection attempts on macOS.
-/// Each attempt waits progressively longer before retrying.
-#[cfg(target_os = "macos")]
-const MACOS_RFCOMM_MAX_RETRIES: u32 = 8;
 
-/// Base delay between RFCOMM connection retries on macOS (milliseconds).
-/// Multiplied by the attempt number: 500, 1000, 1500, 2000, 2500 ms.
-#[cfg(target_os = "macos")]
-const MACOS_RFCOMM_RETRY_BASE_MS: u64 = 500;
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
