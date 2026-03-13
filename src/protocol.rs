@@ -101,7 +101,13 @@ pub const DATA_PACKET_TIMEOUT_SECS: f64 = 8.0;
 // ── BLE Response Codes ───────────────────────────────────────────────────────
 
 /// Success response code from the MW75 status characteristic.
+///
+/// Most commands return `0xF1` for success. Raw mode may return `0xF0`
+/// when the mode change is still pending (timing-dependent).
 pub const BLE_SUCCESS_CODE: u8 = 0xF1;
+
+/// Alternative success code seen for some commands (e.g. raw mode).
+pub const BLE_SUCCESS_CODE_ALT: u8 = 0xF0;
 
 /// Command type byte for EEG enable/disable responses.
 pub const BLE_EEG_COMMAND: u8 = 0x60;
